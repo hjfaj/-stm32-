@@ -1,41 +1,77 @@
+# =========================
+# 1. 基础 C/C++ & 编译输出文件
+# =========================
 # Prerequisites
 *.d
-
 # Compiled Object files
 *.slo
 *.lo
 *.o
 *.obj
-
 # Precompiled Headers
 *.gch
 *.pch
-
 # Linker files
 *.ilk
-
 # Debugger Files
 *.pdb
-
+*.dwo
 # Compiled Dynamic libraries
 *.so
 *.dylib
 *.dll
-
 # Fortran module files
 *.mod
 *.smod
-
 # Compiled Static libraries
 *.lai
 *.la
 *.a
 *.lib
-
 # Executables
 *.exe
 *.out
 *.app
+# OS generated files
+.DS_Store
+Thumbs.db
+core
 
-# debug information files
-*.dwo
+# =========================
+# 2. STM32 / Keil 专属过滤
+# =========================
+*.lst
+*.map
+*.bak
+*.dep
+*.uvoptx
+*.uvguix.*
+*.JLinkScript
+Objects/
+Listings/
+DebugConfig/
+
+# =========================
+# 3. Qt / Qt Creator 专属过滤
+# =========================
+# 忽略 Qt 自动生成的编译文件夹 
+build-*/
+# 忽略 Makefile 和用户特定的项目配置
+Makefile*
+*.pro.user
+*.pro.user.*
+*.qmake.stash
+# 忽略 Qt 编译过程中生成的中间 C++ 代码
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+qrc_*.o
+moc_*.o
+
+# =========================
+# 4. Ubuntu Server / Linux 专属过滤
+# =========================
+*~
+*.swp
+# 忽略 VS Code 远程连接的本地配置
+.vscode/

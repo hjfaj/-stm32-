@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+高级车道线检测程序 (优化版)
+改进特性：
+1. 修复：移除破坏时序逻辑的多线程，确保滤波正确性
+2. 优化：缓存ROI掩码和CLAHE对象，减少内存分配
+3. 改进：输出改为视频文件，避免生成海量图片
+4. 增强：增加拟合算法的鲁棒性，防止空数组报错
+"""
+
+import cv2
+import os
+import numpy as np
+import time
+from collections import deque
+
+# ======================================================
+#                    配置参数
+# ======================================================
+
+VIDEO_PATH = "morning.mp4"      # 输入视频路径
+OUTPUT_DIR = "./output_video"   # 输出目录
+FRAME_GAP = 1                   # 1=处理所有帧 (建议设为1以获得流畅视频)
+SHOW_REAL_TIME = True           # 是否显示实时窗口
+
+class AdvancedLaneDetector:
+    def __init__(self):
+        """初始化高级车道线检测器"""
+        # 基础参数
+        self.image_width = 0
+        self.image_height = 0
+        
+        # 性能优化：缓存对象
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self.roi_mask = None
+        self.roi_vertices = None
+        
+        # 颜色过滤参数（HSL空间）
+        self.white_lower = np.array([0, 200, 0])
+        self.white_upper = np.array([255, 255, 255])
+        self.yellow_lower = np.array([15, 80, 80])
+        self.yellow_upper = np.array([40, 255, 255])
+        
+        # 算法参数
+        self.canny_low = 50
+        self.canny_high = 150
+        self.gaussian_ksize = 5
+        
+        # 霍夫变换参数
+        self.hough_params = {
+            'rho': 1,
+            'theta': np.pi / 180,
+            'threshold': 20,
+            'minLineLength': 30,
+            'maxLineGap': 15
+        }
+        
+        # 几何筛选参数
+        self.lane_min_angle = np.pi * 0.12
+        self.lane_max_angle = np.pi * 0.38
+        self.min_line_length = 25
+        
+        # ROI参数
+        self.roi_ratios = {'bottom': 0.95, 'top': 0.05, 'height': 0.65}
+        
+        # 拟合与滤波
+        self.fit_order = 2
+        self.left_fit_history = deque(maxlen=10)
+        self.right_fit_history = deque(maxlen=10)
+        self.left_detected = False
+        self.right_detected = False
+        
+        # 性能监控
+        self.fps_history = deque(maxlen=30)
+
+    def update_dimensions(self, width, height):
+        """仅在尺寸变化时更新ROI掩码"""
+        if width != self.image_width or height != self.image_height:
+            self.image_width = width
+            self.image_height = height
+            self._create_roi_mask()
+
+    def _create_roi_mask(self):
+        """创建并缓存ROI掩码"""
+        w, h = self.image_width, self.image_height
+        r = self.roi_ratios
+        
+        bottom_left = (int(w * (1 - r['bottom']) / 2), h)
+        bottom_right = (int(w * (1 + r['bottom']) / 2), h)
+        top_left = (int(w * (1 - r['top']) / 2), int(h * (1 - r['height'])))
+        top_right = (int(w * (1 + r['top']) / 2), int(h * (1 - r['height'])))
+        
+        self.roi_vertices = [bottom_left, bottom_right, top_right, top_left]
+        self.roi_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(self.roi_mask, [np.array(self.roi_vertices, np.int32)], 255)
+
+    def process_frame(self, frame):
+        """核心处理管线"""
+        start_time = time.time()
+        
+        # 1. 尺寸检查与缓存更新
+        h, w = frame.shape[:2]
+        self.update_dimensions(w, h)
+        
+        # 2. 预处理
+        # HSL 颜色过滤
+        hsl = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+        white_mask = cv2.inRange(hsl, self.white_lower, self.white_upper)
+        yellow_mask = cv2.inRange(hsl, self.yellow_lower, self.yellow_upper)
+        color_mask = cv2.bitwise_or(white_mask, yellow_mask)
+        color_filtered = cv2.bitwise_and(frame, frame, mask=color_mask)
+        
+        # 灰度与增强
+        gray = cv2.cvtColor(color_filtered, cv2.COLOR_BGR2GRAY)
+        clahe_gray = self.clahe.apply(gray)
+        blur = cv2.GaussianBlur(clahe_gray, (self.gaussian_ksize, self.gaussian_ksize), 0)
+        
+        # 边缘检测与ROI
+        edges = cv2.Canny(blur, self.canny_low, self.canny_high)
+        roi_edges = cv2.bitwise_and(edges, edges, mask=self.roi_mask)
+        
+        # 3. 车道线检测
+        lines = cv2.HoughLinesP(roi_edges, **self.hough_params)
+        left_lanes, right_lanes = self._filter_lines(lines)
+        
+        # 4. 拟合与平滑
+        left_fit, right_fit, left_pts, right_pts = self._fit_lanes(left_lanes, right_lanes)
+        left_fit, right_fit = self._temporal_filter(left_fit, right_fit)
+        
+        # 5. 生成可视化点
+        left_line_pts, right_line_pts = self._generate_points(left_fit, right_fit)
+        
+        # 6. 绘制结果
+        result_frame = self._draw_overlay(frame, left_line_pts, right_line_pts)
+        
+        # 计算FPS
+        self.fps_history.append(time.time() - start_time)
+        
+        # 返回数据包（用于调试）
+        return {
+            'result': result_frame,
+            'edges': edges,
+            'color_filtered': color_filtered,
+            'roi_edges': roi_edges,
+            'debug_info': {
+                'left_detected': self.left_detected,
+                'right_detected': self.right_detected
+            }
+        }
+
+    def _filter_lines(self, lines):
+        if lines is None: return [], []
+        left, right = [], []
+        
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if abs(x2 - x1) < 1e-3: continue # 防止除零
+            
+            slope = (y2 - y1) / (x2 - x1)
+            angle = abs(np.arctan(slope))
+            length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            mid_x = (x1 + x2) / 2
+            
+            # 基础几何筛选
+            if not (self.lane_min_angle <= angle <= self.lane_max_angle and length >= self.min_line_length):
+                continue
+                
+            # 左右分类 (基于斜率和位置)
+            if slope < 0 and mid_x < self.image_width * 0.55:
+                left.append(line)
+            elif slope > 0 and mid_x > self.image_width * 0.45:
+                right.append(line)
+                
+        return left, right
+
+    def _fit_lanes(self, left_lanes, right_lanes):
+        def fit_poly(lines):
+            points = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                points.extend([(x1, y1), (x2, y2)])
+            
+            if len(points) < 3: return None, points
+            
+            pts = np.array(points)
+            try:
+                # 使用异常处理防止拟合失败
+                return np.polyfit(pts[:, 1], pts[:, 0], self.fit_order), points
+            except np.linalg.LinAlgError:
+                return None, points
+
+        left_fit, left_pts = fit_poly(left_lanes)
+        right_fit, right_pts = fit_poly(right_lanes)
+        
+        self.left_detected = left_fit is not None
+        self.right_detected = right_fit is not None
+        
+        return left_fit, right_fit, left_pts, right_pts
+
+    def _temporal_filter(self, left_fit, right_fit):
+        """时序平滑"""
+        if left_fit is not None:
+            self.left_fit_history.append(left_fit)
+        if right_fit is not None:
+            self.right_fit_history.append(right_fit)
+            
+        avg_left = np.mean(self.left_fit_history, axis=0) if self.left_fit_history else None
+        avg_right = np.mean(self.right_fit_history, axis=0) if self.right_fit_history else None
+        
+        return avg_left, avg_right
+
+    def _generate_points(self, left_fit, right_fit):
+        if self.image_height == 0: return [], []
+        
+        y_pts = np.linspace(
+            self.image_height * (1 - self.roi_ratios['height']), 
+            self.image_height, 50
+        )
+        
+        def get_line_pts(fit):
+            if fit is None: return []
+            pts = []
+            for y in y_pts:
+                x = np.polyval(fit, y)
+                pts.append((int(x), int(y)))
+            return pts
+            
+        return get_line_pts(left_fit), get_line_pts(right_fit)
+
+    def _draw_overlay(self, frame, left_pts, right_pts):
+        overlay = frame.copy()
+        
+        # 绘制车道区域
+        if left_pts and right_pts:
+            pts = np.vstack([np.array(left_pts), np.array(right_pts)[::-1]])
+            cv2.fillPoly(overlay, [pts], (0, 255, 0))
+            
+        # 混合图像
+        result = cv2.addWeighted(frame, 1, overlay, 0.3, 0)
+        
+        # 绘制车道线实体
+        if left_pts:
+            cv2.polylines(result, [np.array(left_pts, np.int32)], False, (0, 0, 255), 3)
+        if right_pts:
+            cv2.polylines(result, [np.array(right_pts, np.int32)], False, (255, 0, 0), 3)
+            
+        # 绘制ROI边界（调试用，可选）
+        if self.roi_vertices:
+            cv2.polylines(result, [np.array(self.roi_vertices, np.int32)], True, (0, 100, 100), 1)
+            
+        # FPS 显示
+        fps = 1.0 / (sum(self.fps_history) / len(self.fps_history)) if self.fps_history else 0
+        cv2.putText(result, f"FPS: {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        
+        return result
+
+    def get_debug_panel(self, data):
+        """生成调试面板"""
+        h, w = data['result'].shape[:2]
+        panel = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        small_h, small_w = h // 2, w // 2
+        
+        # 转换并缩放图像
+        res = cv2.resize(data['result'], (small_w, small_h))
+        col = cv2.resize(data['color_filtered'], (small_w, small_h))
+        edg = cv2.cvtColor(cv2.resize(data['edges'], (small_w, small_h)), cv2.COLOR_GRAY2BGR)
+        roi = cv2.cvtColor(cv2.resize(data['roi_edges'], (small_w, small_h)), cv2.COLOR_GRAY2BGR)
+        
+        panel[0:small_h, 0:small_w] = res
+        panel[0:small_h, small_w:w] = col
+        panel[small_h:h, 0:small_w] = edg
+        panel[small_h:h, small_w:w] = roi
+        
+        cv2.line(panel, (0, small_h), (w, small_h), (255, 255, 255), 2)
+        cv2.line(panel, (small_w, 0), (small_w, h), (255, 255, 255), 2)
+        
+        return panel
+
+def process_video():
+    if not os.path.exists(VIDEO_PATH):
+        print(f"错误: 文件 {VIDEO_PATH} 不存在")
+        return
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    
+    # 视频写入器配置
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # 输出路径
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(OUTPUT_DIR, f"result_{timestamp}.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+    
+    detector = AdvancedLaneDetector()
+    
+    print(f"开始处理: {VIDEO_PATH}")
+    print(f"输出文件: {out_path}")
+    print("按 'q' 键退出，按 'd' 切换调试视图")
+    
+    frame_count = 0
+    show_debug = False
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+        
+        # 间隔处理
+        if frame_count % FRAME_GAP == 0:
+            data = detector.process_frame(frame)
+            
+            # 写入视频 (始终写入处理后的结果)
+            writer.write(data['result'])
+            
+            if SHOW_REAL_TIME:
+                display = detector.get_debug_panel(data) if show_debug else data['result']
+                cv2.imshow('Advanced Lane Detection', display)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'): break
+                elif key == ord('d'): show_debug = not show_debug
+        
+        frame_count += 1
+        if frame_count % 30 == 0:
+            print(f"\r已处理帧数: {frame_count}", end="")
+
+    cap.release()
+    writer.release()
+    cv2.destroyAllWindows()
+    print("\n处理完成！")
+
+if __name__ == "__main__":
+    process_video()
